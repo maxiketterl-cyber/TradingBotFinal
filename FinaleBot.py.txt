@@ -1,0 +1,162 @@
+import os
+from telegram import Bot
+from telegram.ext import Updater, CommandHandler, MessageHandler, filters
+from apscheduler.schedulers.background import BackgroundScheduler
+import yfinance as yf
+import matplotlib.pyplot as plt
+from io import BytesIO
+
+# ========================
+# 1️⃣ Telegram Setup
+# ========================
+TOKEN = os.environ.get("8258648246:AAH2DeSNM80cfEfIwCtTaJj9omCi8RP7bQU")
+CHAT_ID = os.environ.get("5808189982")
+bot = Bot(token=TOKEN)
+
+# ========================
+# 2️⃣ Aktienliste + Schwellen
+# ========================
+# buy_pct / sell_pct: initiale Schwellen
+# sl_pct: Stop-Loss %, tp_pct: Take-Profit %
+stocks = {
+    "AAPL": {"buy_pct": 0.02, "sell_pct": 0.02, "sl_pct": 0.03, "tp_pct": 0.05},
+    "MSFT": {"buy_pct": 0.02, "sell_pct": 0.02, "sl_pct": 0.03, "tp_pct": 0.05},
+    "GOOG": {"buy_pct": 0.03, "sell_pct": 0.03, "sl_pct": 0.03, "tp_pct": 0.05},
+    "NVDA": {"buy_pct": 0.03, "sell_pct": 0.03, "sl_pct": 0.04, "tp_pct": 0.06},
+    "TSLA": {"buy_pct": 0.04, "sell_pct": 0.04, "sl_pct": 0.05, "tp_pct": 0.07},
+    "AMZN": {"buy_pct": 0.03, "sell_pct": 0.03, "sl_pct": 0.04, "tp_pct": 0.06},
+    "META": {"buy_pct": 0.03, "sell_pct": 0.03, "sl_pct": 0.04, "tp_pct": 0.06},
+    "BABA": {"buy_pct": 0.04, "sell_pct": 0.04, "sl_pct": 0.05, "tp_pct": 0.07},
+    "JPM": {"buy_pct": 0.02, "sell_pct": 0.02, "sl_pct": 0.03, "tp_pct": 0.05},
+    "UNH": {"buy_pct": 0.02, "sell_pct": 0.02, "sl_pct": 0.03, "tp_pct": 0.05},
+    "V": {"buy_pct": 0.02, "sell_pct": 0.02, "sl_pct": 0.03, "tp_pct": 0.05},
+    "PG": {"buy_pct": 0.01, "sell_pct": 0.01, "sl_pct": 0.02, "tp_pct": 0.03},
+    "KO": {"buy_pct": 0.01, "sell_pct": 0.01, "sl_pct": 0.02, "tp_pct": 0.03}
+}
+
+# Historische letzte Käufe merken
+last_trade = {t: None for t in stocks.keys()}
+
+# ========================
+# 3️⃣ Trading Funktionen
+# ========================
+
+def check_price(ticker_symbol):
+    ticker = yf.Ticker(ticker_symbol)
+    price = ticker.history(period="1d")["Close"].iloc[-1]
+    return price
+
+def compute_dynamic_thresholds(ticker_symbol, buy_pct, sell_pct):
+    last_close = check_price(ticker_symbol)
+    buy_threshold = last_close * (1 - buy_pct)
+    sell_threshold = last_close * (1 + sell_pct)
+    return buy_threshold, sell_threshold
+
+def trend_confirmed(ticker_symbol, trend="up", periods=3):
+    ticker = yf.Ticker(ticker_symbol)
+    data = ticker.history(period=f"{periods}d")["Close"]
+    if len(data) < periods:
+        return False
+    if trend == "up":
+        return all(data[i] > data[i-1] for i in range(1, len(data)))
+    elif trend == "down":
+        return all(data[i] < data[i-1] for i in range(1, len(data)))
+    return False
+
+def trading_signal(price, buy_threshold, sell_threshold):
+    if price < buy_threshold:
+        return "BUY"
+    elif price > sell_threshold:
+        return "SELL"
+    else:
+        return "HOLD"
+
+def create_chart(ticker_symbol):
+    ticker = yf.Ticker(ticker_symbol)
+    data = ticker.history(period="7d")["Close"]
+    plt.figure(figsize=(4,3))
+    data.plot(title=ticker_symbol)
+    plt.tight_layout()
+    buf = BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    buf.seek(0)
+    return buf
+
+def compute_sl_tp(price, sl_pct, tp_pct):
+    stop_loss = price * (1 - sl_pct)
+    take_profit = price * (1 + tp_pct)
+    return stop_loss, take_profit
+
+# ========================
+# 4️⃣ Ultimativer Trading Job
+# ========================
+
+def send_trading_signal():
+    messages = []
+    charts = []
+
+    for t, pct in stocks.items():
+        price = check_price(t)
+        buy_thresh, sell_thresh = compute_dynamic_thresholds(t, pct["buy_pct"], pct["sell_pct"])
+        signal = trading_signal(price, buy_thresh, sell_thresh)
+
+        # Trendbestätigung & Signifikante Bewegung (>1% seit letztem Signal)
+        last = last_trade[t]
+        changed = True
+        if last:
+            change_pct = abs(price - last["price"]) / last["price"]
+            if change_pct < 0.01:  # <1% Veränderung
+                changed = False
+
+        if signal == "BUY" and trend_confirmed(t, trend="down", periods=3) and changed:
+            sl, tp = compute_sl_tp(price, pct["sl_pct"], pct["tp_pct"])
+            messages.append(f"💰 {t}: BUY Signal!\nPreis: {price:.2f}$\nBuy < {buy_thresh:.2f}$\nStop-Loss: {sl:.2f}$ | Take-Profit: {tp:.2f}$")
+            charts.append(create_chart(t))
+            last_trade[t] = {"type": "BUY", "price": price}
+
+        elif signal == "SELL" and trend_confirmed(t, trend="up", periods=3) and changed:
+            sl, tp = compute_sl_tp(price, pct["sl_pct"], pct["tp_pct"])
+            messages.append(f"📈 {t}: SELL Signal!\nPreis: {price:.2f}$\nSell > {sell_thresh:.2f}$\nStop-Loss: {sl:.2f}$ | Take-Profit: {tp:.2f}$")
+            charts.append(create_chart(t))
+            last_trade[t] = {"type": "SELL", "price": price}
+
+    # Alle Signale zusammenfassen
+    for msg, chart in zip(messages, charts):
+        bot.send_photo(chat_id=CHAT_ID, photo=chart, caption=msg)
+
+# ========================
+# 5️⃣ Scheduler Setup
+# ========================
+scheduler = BackgroundScheduler()
+scheduler.add_job(send_trading_signal, "interval", minutes=10)  # Intervalle anpassbar
+scheduler.start()
+
+# ========================
+# 6️⃣ Command Handler
+# ========================
+def start(update, context):
+    update.message.reply_text("Bot läuft! Ultimativer Trading-Assistent aktiv. 📈💰🛑")
+
+def help_command(update, context):
+    update.message.reply_text("Verfügbare Commands:\n/start - Startet Bot\n/help - Diese Hilfe")
+
+def echo(update, context):
+    update.message.reply_text(f"Du hast geschrieben: {update.message.text}")
+
+# ========================
+# 7️⃣ Updater / Dispatcher
+# ========================
+updater = Updater(TOKEN)
+dispatcher = updater.dispatcher
+
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("help", help_command))
+dispatcher.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+# ========================
+# 8️⃣ Bot starten
+# ========================
+print("Starte Ultimativen Trading-Assistenten Final...")
+updater.start_polling()
+updater.idle()
